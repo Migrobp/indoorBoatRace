@@ -39,7 +39,9 @@ int sailPosition = 90;
 Servo servoRudder;
 Servo servoSail;
 
-#define MOTOR_PIN 12
+#define MOTORMODE 5
+#define MOTOR_PIN_FORWARD 12
+#define MOTOR_PIN_BACKWARD 14
 
 #define BUTTON_PIN 19
 #define LED_BUILTIN 2
@@ -50,6 +52,8 @@ unsigned long lastPrintFunctionRunTime = 0;
 unsigned long lastServoRunTime = 0;
 unsigned long lastBluetoothRunTime = 0;
 unsigned long currentTime = 0;
+
+unsigned int loopTime = 0;
 
 // Millis
 unsigned long previousMillis = 0;               // Variable to store the previous timestamp
@@ -65,27 +69,9 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-const int polarDiagram[][2] = {
-  { 0, 0 },
-  { 10, 327 },
-  { 20, 638 },
-  { 30, 916 },
-  { 40, 1145 },
-  { 50, 1312 },
-  { 60, 1429 },
-  { 70, 1528 },
-  { 80, 1664 },
-  { 90, 1747 },
-  { 100, 1801 },
-  { 110, 1829 },
-  { 120, 1856 },
-  { 130, 1832 },
-  { 140, 1723 },
-  { 150, 1406 },
-  { 160, 1205 },
-  { 170, 1075 },
-  { 180, 947 },
-};
+const int polarDiagram[] = { 0, 327, 638, 916, 1145, 1312, 1429, 1528, 1664, 1747, 1801, 1829, 1856, 1832, 1723, 1406, 1205, 1075, 947 };
+
+const int sailTrimDiagram[] = { 0, 0, 111, 166, 222, 277, 333, 388, 444, 500, 555, 611, 666, 722, 777, 833, 888, 944, 1000 };
 
 const float polarDiagramMaxValue = 1856;
 const int tableSize = sizeof(polarDiagram) / sizeof(polarDiagram[0]);
@@ -101,7 +87,10 @@ int speedFactor = 0;
 int motorPin = 3;
 int motorSpeed = 0;
 
+bool portSide = true;
+
 float trimFactor = 0;
+float polarSpeedFactor = 0;
 
 int oldSailServoValue = 0;
 int oldRudderServoValue = 0;
@@ -113,7 +102,14 @@ void setup(void) {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(MOTOR_PIN, OUTPUT);
+  pinMode(MOTORMODE, OUTPUT);
+  pinMode(MOTOR_PIN_FORWARD, OUTPUT);
+  pinMode(MOTOR_PIN_BACKWARD, OUTPUT);
+
+  digitalWrite(MOTOR_PIN_FORWARD, LOW);
+  digitalWrite(MOTOR_PIN_BACKWARD, LOW);
+  digitalWrite(MOTORMODE, LOW);
+
 
   // MPU6050
   pinMode(13, OUTPUT);
@@ -190,8 +186,8 @@ void setup(void) {
   servoSail.attach(sailPin, 500, 2500);
   servoRudder.write(rudderPosition);
   servoSail.write(sailPosition);
-  servoRudder.detach();
-  servoSail.detach();
+  //servoRudder.detach();
+  //servoSail.detach();
   delay(100);
 }
 
@@ -203,14 +199,17 @@ void loop() {
   setCourse();
   calculateWind();
   if (deviceConnected) {
-    servoRudder.attach(rudderPin, 500, 2500);
-    servoSail.attach(sailPin, 500, 2500);
+    //servoRudder.attach(rudderPin, 500, 2500);
+    //servoSail.attach(sailPin, 500, 2500);
+    digitalWrite(MOTORMODE, HIGH);
     controlServos();
-    //controlMotor();
+    controlMotor();
   } else {
-    servoRudder.detach();
-    servoSail.detach();
-    analogWrite(MOTOR_PIN, 0);
+    //servoRudder.detach();
+    //servoSail.detach();
+    digitalWrite(MOTOR_PIN_FORWARD, LOW);
+    digitalWrite(MOTOR_PIN_BACKWARD, LOW);
+    digitalWrite(MOTORMODE, LOW);
   }
 
   printFunction();
@@ -220,19 +219,23 @@ void bluetooth() {
   // notify changed value
   if (deviceConnected) {
     // Calculate the elapsed time since the last function run
-    unsigned long elapsedTime = currentTime - lastBluetoothRunTime;
+    //unsigned long currentTime = millis();
+    //unsigned long elapsedTime = currentTime - lastBluetoothRunTime;
 
     // Check if enough time has elapsed since the last run
-    if (elapsedTime >= 15) {  // Run every 15 milliseconds
-      lastBluetoothRunTime = currentTime;
-      sendBatteryVoltage();
-      uint8_t* servoValue = pServo->getData();
+    //if (elapsedTime >= 20) {  // Run every 20 milliseconds
+    lastBluetoothRunTime = currentTime;
+    sendBatteryVoltage();
+    uint8_t* servoValue = pServo->getData();
 
-      rudderPosition = servoValue[0];
-      sailPosition = servoValue[1];
-    }
+    rudderPosition = servoValue[0];
+    sailPosition = servoValue[1];
 
-    //delay(15);  // bluetooth stack will go into congestion, if too many packets are sent, in 6 hours test i was able to go as low as 3ms
+    //servoRudder.write(rudderPosition);
+    //servoSail.write(sailPosition);
+    //}
+
+    delay(20);  // bluetooth stack will go into congestion, if too many packets are sent, in 6 hours test i was able to go as low as 3ms
   }
   // disconnecting
   if (!deviceConnected && oldDeviceConnected) {
@@ -264,42 +267,52 @@ void sendBatteryVoltage() {
 
 void controlServos() {
   // Calculate the elapsed time since the last function run
-  unsigned long elapsedTime = currentTime - lastServoRunTime;
-
+  //unsigned long elapsedTime = currentTime - lastServoRunTime;
   // Check if enough time has elapsed since the last run
-  if (elapsedTime >= 15) {  // Run every 15 milliseconds
-    lastServoRunTime = currentTime;
-    if (currentAngle > courseValue) {
-      trueSailPos = map(sailPosition, 0, 180, 90, 10);
-    } else if (currentAngle < courseValue) {
-      trueSailPos = map(sailPosition, 0, 180, 90, 170);
-    }
+  //if (elapsedTime >= 15 - loopTime) {  // Run every 15 milliseconds
+  //lastServoRunTime = currentTime;
+  //servoSail.write(sailPosition);
+  //Serial.println(sailPosition);
 
-    if (trueSailPos != oldSailServoValue) {
-      smoothedSailServoValue = (trueSailPos * 0.95) + (oldSailServoValue * 0.95) / 100;
-      servoSail.write(smoothedSailServoValue);
-      oldSailServoValue = smoothedSailServoValue;
-    }
 
-    if (rudderPosition != oldRudderServoValue) {
-      smoothedRudderServoValue = (rudderPosition * 0.95) + (oldRudderServoValue * 0.95 / 100);
-      servoRudder.write(smoothedRudderServoValue);
-      oldRudderServoValue = smoothedRudderServoValue;
-    }
+  //servoRudder.write(rudderPosition);
+  //servoSail.write(trueSailPos);
+
+
+  //if (trueSailPos != oldSailServoValue) {
+  smoothedSailServoValue = (sailPosition * 0.05) + (oldSailServoValue * 0.95);
+  oldSailServoValue = smoothedSailServoValue;
+  //}
+
+  //if (rudderPosition != oldRudderServoValue) {
+  smoothedRudderServoValue = (rudderPosition * 0.05) + (oldRudderServoValue * 0.95);
+  oldRudderServoValue = smoothedRudderServoValue;
+  //}
+
+  if (portSide) {
+    trueSailPos = map(smoothedSailServoValue, 0, 180, 90, 0);
+  } else {
+    trueSailPos = map(smoothedSailServoValue, 0, 180, 90, 180);
   }
+
+  servoRudder.write(smoothedRudderServoValue);
+  servoSail.write(trueSailPos);
+
+
+
+  //}
 }
 
 void calculateWind() {
-  // BAGBORD HALSE
-  if (currentAngle > courseValue + 20) {
-    trimFactor = abs(courseValue) - sailPosition - 20;
+  if (currentAngle > 20) {
+    trimFactor = abs((180 - smoothedSailServoValue - currentAngle) / 180);
   }
-  // STYRBORD HALSE
-  if (currentAngle < courseValue - 20) {
-    trimFactor = abs(courseValue) - sailPosition - 20;
+  polarSpeedFactor = polarDiagram[currentAngle / 10] / polarDiagramMaxValue;
+  //Serial.println(polarSpeedFactor);
+  motorSpeed = 255 * polarSpeedFactor * trimFactor;
+  if (motorSpeed == 0) {
+    motorSpeed = 50;
   }
-
-  motorSpeed = 255 * trimFactor / 160 * findClosestAngle(currentAngle);
 }
 
 void gyroRotation() {
@@ -317,26 +330,36 @@ void gyroRotation() {
     TotalYawAngle += RateYaw * dt;
 
     // Wrap the angle around to [0, 360) range
-    TotalYawAngle = fmod(TotalYawAngle, 360.0);
+    //TotalYawAngle = fmod(TotalYawAngle, 360.0);
 
     // Handle the case when the angle becomes negative
-    // if (TotalYawAngle < 0.0) {
-    //   TotalYawAngle += 360.0;
-    // }
+    if (TotalYawAngle < -180.0) {
+      TotalYawAngle += 360.0;
+    }
 
-    currentAngle = TotalYawAngle;
+    if (TotalYawAngle > 180.0) {
+      TotalYawAngle += -360.0;
+    }
+    if (TotalYawAngle > 0) {
+      portSide = true;
+    } else {
+      portSide = false;
+    }
+
+    currentAngle = abs(TotalYawAngle);
   }
 }
 
 
 void setCourse() {
   if (!digitalRead(BUTTON_PIN)) {
-    courseValue = currentAngle;
+    TotalYawAngle = 0;
+    //courseValue = currentAngle;
   }
 }
 
 void blink() {
-  if (currentAngle <= courseValue + 20 and currentAngle >= courseValue - 20) {
+  if (currentAngle <= 20) {
     digitalWrite(LED_BUILTIN, HIGH);
   } else {
     digitalWrite(LED_BUILTIN, LOW);
@@ -344,7 +367,8 @@ void blink() {
 }
 
 void controlMotor() {
-  analogWrite(MOTOR_PIN, motorSpeed);
+  analogWrite(MOTOR_PIN_FORWARD, motorSpeed);
+  digitalWrite(MOTOR_PIN_BACKWARD, LOW);
 }
 
 void gyro_signals(void) {
@@ -368,54 +392,46 @@ void gyro_signals(void) {
   RateYaw = (float)GyroZ / 65.5;
 }
 
-float findClosestAngle(int targetAngle) {
-  int closestAngle = polarDiagram[0][0];
-  int minDifference = abs(targetAngle - closestAngle);
-
-  for (int i = 1; i < tableSize; ++i) {
-    int currentDifference = abs(targetAngle - polarDiagram[i][0]);
-    if (currentDifference < minDifference) {
-      minDifference = currentDifference;
-      closestAngle = polarDiagram[i][0];
-    }
-  }
-
-  return closestAngle / polarDiagramMaxValue;
-}
-
 void printFunction() {
-  unsigned long elapsedTime = currentTime - lastPrintFunctionRunTime;
+  if (Serial) {
+    unsigned long elapsedTime = currentTime - lastPrintFunctionRunTime;
 
-  // Check if enough time has elapsed since the last run
-  if (elapsedTime >= 200) {  // Run every 200 milliseconds
-    lastPrintFunctionRunTime = currentTime;
+    // Check if enough time has elapsed since the last run
+    if (elapsedTime >= 200) {  // Run every 200 milliseconds
+      lastPrintFunctionRunTime = currentTime;
+      loopTime = millis() - currentTime;
 
-    Serial.println("");
-    Serial.print("CurrentAngle: ");
-    Serial.print(currentAngle);
-    Serial.print(" | Yaw Angle [°]= ");
-    Serial.print(TotalYawAngle);
-    Serial.print(" | ");
-    Serial.print("Course Value: ");
-    Serial.print(courseValue);
-    Serial.print(" | ");
-    Serial.print("RudderPOS: ");
-    Serial.print(smoothedRudderServoValue);
-    Serial.print(" | ");
-    Serial.print("SailPOS: ");
-    Serial.print(sailPosition);
-    Serial.print(" | ");
-    Serial.print("SF: ");
-    Serial.print(speedFactor);
-    Serial.print(" | ");
-    Serial.print("MotorSpeed: ");
-    Serial.print(motorSpeed);
+      Serial.println("");
+      Serial.print("CurrentAngle: ");
+      Serial.print(currentAngle);
+      Serial.print(" | Yaw Angle [°]= ");
+      Serial.print(TotalYawAngle);
+      Serial.print(" | ");
+      Serial.print("Course Value: ");
+      Serial.print(courseValue);
+      Serial.print(" | ");
+      Serial.print("RudderPOS: ");
+      Serial.print(smoothedRudderServoValue);
+      Serial.print(" | ");
+      Serial.print("SailPOS: ");
+      Serial.print(smoothedSailServoValue);
+      Serial.print(" | ");
+      Serial.print("SF: ");
+      Serial.print(speedFactor);
+      Serial.print(" | ");
+      Serial.print("MotorSpeed: ");
+      Serial.print(motorSpeed);
 
-    Serial.print(" | ");
-    Serial.print("trimFactor: ");
-    Serial.print(trimFactor);
-    Serial.print(" | ");
-    Serial.print("closestAngle: ");
-    Serial.print(findClosestAngle(currentAngle));
+      Serial.print(" | ");
+      Serial.print("trimFactor: ");
+      Serial.print(abs(trimFactor));
+      Serial.print(" | ");
+      Serial.print("polarFactor: ");
+      Serial.print(polarSpeedFactor);
+      Serial.print(" | Loop time: ");
+      Serial.print(loopTime);
+      Serial.print(" | PortSide: ");
+      Serial.print(portSide);
+    }
   }
 }
