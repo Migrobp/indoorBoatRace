@@ -39,7 +39,7 @@ int sailPosition = 90;
 Servo servoRudder;
 Servo servoSail;
 
-#define MOTORMODE 5
+#define MOTORMODE 4
 #define MOTOR_PIN_FORWARD 12
 #define MOTOR_PIN_BACKWARD 14
 
@@ -86,6 +86,7 @@ int trueSailPos = 0;
 int speedFactor = 0;
 int motorPin = 3;
 int motorSpeed = 0;
+int minimumMotorSpeed = 50;
 
 bool portSide = true;
 
@@ -122,6 +123,8 @@ void setup(void) {
   Wire.write(0x00);
   Wire.endTransmission();
 
+
+
   for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
     gyro_signals();
     RateCalibrationRoll += RateRoll;
@@ -133,12 +136,19 @@ void setup(void) {
   RateCalibrationPitch /= 2000;
   RateCalibrationYaw /= 2000;
 
+  // **************************************************************************
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+  digitalWrite(LED_BUILTIN, HIGH);
+
   // Create the BLE Device
   BLEDevice::init("Land Sailor - RED");
+  // **************************************************************************
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
+
 
   // Create the BLE Service
   BLEService* pService = pServer->createService(SERVICE_UUID);
@@ -150,7 +160,7 @@ void setup(void) {
 
   pServo = pService->createCharacteristic(
     SERVO_CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_WRITE);
+    BLECharacteristic::PROPERTY_WRITE_NR);
 
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
   // Create a BLE Descriptor
@@ -167,9 +177,12 @@ void setup(void) {
   pBattery->addDescriptor(pBatteryDescr);
   pBattery->addDescriptor(pBLE2902);
 
+
+
   // Added at combined servo characteristic to minimize amount packages.
   pServo->addDescriptor(pServoDescr);
   pServo->addDescriptor(new BLE2902());
+
 
   // Start the service
   pService->start();
@@ -195,7 +208,7 @@ void loop() {
   currentTime = millis();
   gyroRotation();
   bluetooth();
-  blink();
+  upWind();
   setCourse();
   calculateWind();
   if (deviceConnected) {
@@ -210,6 +223,7 @@ void loop() {
     digitalWrite(MOTOR_PIN_FORWARD, LOW);
     digitalWrite(MOTOR_PIN_BACKWARD, LOW);
     digitalWrite(MOTORMODE, LOW);
+    //blink();
   }
 
   printFunction();
@@ -290,12 +304,12 @@ void controlServos() {
   //}
 
   if (portSide) {
-    trueSailPos = map(smoothedSailServoValue, 0, 180, 90, 0);
+    trueSailPos = map(sailPosition, 0, 180, 90, 0);
   } else {
-    trueSailPos = map(smoothedSailServoValue, 0, 180, 90, 180);
+    trueSailPos = map(sailPosition, 0, 180, 90, 180);
   }
 
-  servoRudder.write(smoothedRudderServoValue);
+  servoRudder.write(rudderPosition);
   servoSail.write(trueSailPos);
 
 
@@ -309,10 +323,7 @@ void calculateWind() {
   }
   polarSpeedFactor = polarDiagram[currentAngle / 10] / polarDiagramMaxValue;
   //Serial.println(polarSpeedFactor);
-  motorSpeed = 255 * polarSpeedFactor * trimFactor;
-  if (motorSpeed == 0) {
-    motorSpeed = 50;
-  }
+  motorSpeed = minimumMotorSpeed + (255 - minimumMotorSpeed * polarSpeedFactor * trimFactor);
 }
 
 void gyroRotation() {
@@ -358,7 +369,7 @@ void setCourse() {
   }
 }
 
-void blink() {
+void upWind() {
   if (currentAngle <= 20) {
     digitalWrite(LED_BUILTIN, HIGH);
   } else {
@@ -434,4 +445,11 @@ void printFunction() {
       Serial.print(portSide);
     }
   }
+}
+
+void blink() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(100);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(100);
 }
