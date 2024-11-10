@@ -2,8 +2,41 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <ESP32_Servo.h>
+#include <ESP32Servo.h>
 #include <Wire.h>
+
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+/* MPU6050 default I2C address is 0x68*/
+MPU6050 mpu;
+
+#define OUTPUT_READABLE_YAWPITCHROLL
+
+int const INTERRUPT_PIN = 15;  // Define the interruption #0 pin
+
+/*---MPU6050 Control/Status Variables---*/
+bool DMPReady = false;   // Set true if DMP init was successful
+uint8_t MPUIntStatus;    // Holds actual interrupt status byte from MPU
+uint8_t devStatus;       // Return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;     // Expected DMP packet size (default is 42 bytes)
+uint8_t FIFOBuffer[64];  // FIFO storage buffer
+
+/*---Orientation/Motion Variables---*/
+Quaternion q;         // [w, x, y, z]         Quaternion container
+VectorInt16 aa;       // [x, y, z]            Accel sensor measurements
+VectorInt16 gy;       // [x, y, z]            Gyro sensor measurements
+VectorInt16 aaReal;   // [x, y, z]            Gravity-free accel sensor measurements
+VectorInt16 aaWorld;  // [x, y, z]            World-frame accel sensor measurements
+VectorFloat gravity;  // [x, y, z]            Gravity vector
+float euler[3];       // [psi, theta, phi]    Euler angle container
+float ypr[3];         // [yaw, pitch, roll]   Yaw/Pitch/Roll container and gravity vector
+
+/*------Interrupt detection routine------*/
+volatile bool MPUInterrupt = false;  // Indicates whether MPU6050 interrupt pin has gone high
+void DMPDataReady() {
+  MPUInterrupt = true;
+}
 
 
 // MPU6050
@@ -40,8 +73,8 @@ Servo servoRudder;
 Servo servoSail;
 
 #define MOTORMODE 4
-#define MOTOR_PIN_FORWARD 12
-#define MOTOR_PIN_BACKWARD 14
+#define MOTOR_PIN_FORWARD 14
+#define MOTOR_PIN_BACKWARD 12
 
 #define BUTTON_PIN 19
 #define LED_BUILTIN 2
@@ -78,13 +111,13 @@ const int tableSize = sizeof(polarDiagram) / sizeof(polarDiagram[0]);
 
 
 // COURSE Things //
+int windDirection = 0;
 int courseValue = 0;
 int currentAngle = 0;
 int sailControl = 0;
 int sailAngles[100] = { 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180 };
 int trueSailPos = 0;
 int speedFactor = 0;
-int motorPin = 3;
 int motorSpeed = 0;
 int minimumMotorSpeed = 50;
 
@@ -100,7 +133,72 @@ float smoothedSailServoValue = 0;
 float smoothedRudderServoValue = 0;
 
 void setup(void) {
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire.begin();
+  Wire.setClock(400000);  // 400kHz I2C clock. Comment on this line if having compilation difficulties
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);
+#endif
+
+
   Serial.begin(115200);
+  while (!Serial)
+    ;
+
+  /*Initialize device*/
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+  pinMode(INTERRUPT_PIN, INPUT);
+
+  /*Verify connection*/
+  Serial.println(F("Testing MPU6050 connection..."));
+  if (mpu.testConnection() == false) {
+    Serial.println("MPU6050 connection failed");
+    while (true)
+      ;
+  } else {
+    Serial.println("MPU6050 connection successful");
+  }
+
+  devStatus = mpu.dmpInitialize();
+
+  /* Supply your gyro offsets here, scaled for min sensitivity */
+  mpu.setXGyroOffset(0);
+  mpu.setYGyroOffset(0);
+  mpu.setZGyroOffset(0);
+  mpu.setXAccelOffset(0);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
+
+  /* Making sure it worked (returns 0 if so) */
+  if (devStatus == 0) {
+    mpu.CalibrateAccel(6);  // Calibration Time: generate offsets and calibrate our MPU6050
+    mpu.CalibrateGyro(6);
+    Serial.println("These are the Active offsets: ");
+    mpu.PrintActiveOffsets();
+    Serial.println(F("Enabling DMP..."));  //Turning ON DMP
+    mpu.setDMPEnabled(true);
+
+    /*Enable Arduino interrupt detection*/
+    Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+    Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+    Serial.println(F(")..."));
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), DMPDataReady, RISING);
+    MPUIntStatus = mpu.getIntStatus();
+
+    /* Set the DMP Ready flag so the main loop() function knows it is okay to use it */
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    DMPReady = true;
+    packetSize = mpu.dmpGetFIFOPacketSize();  //Get expected DMP packet size for later comparison
+  } else {
+    Serial.print(F("DMP Initialization failed (code "));  //Print the error code
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+  }
+
+
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(MOTORMODE, OUTPUT);
@@ -110,31 +208,6 @@ void setup(void) {
   digitalWrite(MOTOR_PIN_FORWARD, LOW);
   digitalWrite(MOTOR_PIN_BACKWARD, LOW);
   digitalWrite(MOTORMODE, LOW);
-
-
-  // MPU6050
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);
-  Wire.setClock(400000);
-  Wire.begin();
-  delay(250);
-  Wire.beginTransmission(0x68);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  Wire.endTransmission();
-
-
-
-  for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
-    gyro_signals();
-    RateCalibrationRoll += RateRoll;
-    RateCalibrationPitch += RatePitch;
-    RateCalibrationYaw += RateYaw;
-    delay(1);
-  }
-  RateCalibrationRoll /= 2000;
-  RateCalibrationPitch /= 2000;
-  RateCalibrationYaw /= 2000;
 
   // **************************************************************************
   digitalWrite(LED_BUILTIN, LOW);
@@ -196,6 +269,7 @@ void setup(void) {
   Serial.println("Waiting a client connection to notify...");
 
   servoRudder.attach(rudderPin, 500, 2500);
+
   servoSail.attach(sailPin, 500, 2500);
   servoRudder.write(rudderPosition);
   servoSail.write(sailPosition);
@@ -205,6 +279,8 @@ void setup(void) {
 }
 
 void loop() {
+  if (!DMPReady) return;
+
   currentTime = millis();
   gyroRotation();
   bluetooth();
@@ -220,8 +296,8 @@ void loop() {
   } else {
     //servoRudder.detach();
     //servoSail.detach();
-    digitalWrite(MOTOR_PIN_FORWARD, LOW);
-    digitalWrite(MOTOR_PIN_BACKWARD, LOW);
+    analogWrite(MOTOR_PIN_FORWARD, 0);
+    analogWrite(MOTOR_PIN_BACKWARD, 0);
     digitalWrite(MOTORMODE, LOW);
     //blink();
   }
@@ -323,48 +399,52 @@ void calculateWind() {
   }
   polarSpeedFactor = polarDiagram[currentAngle / 10] / polarDiagramMaxValue;
   //Serial.println(polarSpeedFactor);
-  motorSpeed = minimumMotorSpeed + (255 - minimumMotorSpeed * polarSpeedFactor * trimFactor);
+
+  motorSpeed = (255 - minimumMotorSpeed) * polarSpeedFactor * trimFactor + minimumMotorSpeed;
 }
 
 void gyroRotation() {
-  gyro_signals();
-  float dt = (currentTime - lastTime) / 1000.0;  // Convert milliseconds to seconds
+  /* Read a packet from FIFO */
+  if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) {  // Get the Latest packet
+#ifdef OUTPUT_READABLE_YAWPITCHROLL
+    /* Display Euler angles in degrees */
+    mpu.dmpGetQuaternion(&q, FIFOBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    // Serial.print("ypr\t");
+    // Serial.print(ypr[0] * 180 / M_PI);
+    // Serial.print("\t");
+    // Serial.print(ypr[1] * 180 / M_PI);
+    // Serial.print("\t");
+    // Serial.println(ypr[2] * 180 / M_PI);
+    //currentAngle = abs(ypr[0] * 180 / M_PI - windDirection);
+#endif
 
-  // Check if enough time has elapsed since the last update
-  if (dt >= 0.03) {  // Update every 30 milliseconds (adjust as needed)
-    lastTime = currentTime;
+    currentAngle = ypr[0] * 180 / M_PI - windDirection;
 
-    // Subtract the calibration value
-    RateYaw -= RateCalibrationYaw;
-
-    // Integrate the yaw rate to get the total angle
-    TotalYawAngle += RateYaw * dt;
-
-    // Wrap the angle around to [0, 360) range
-    //TotalYawAngle = fmod(TotalYawAngle, 360.0);
-
-    // Handle the case when the angle becomes negative
-    if (TotalYawAngle < -180.0) {
-      TotalYawAngle += 360.0;
-    }
-
-    if (TotalYawAngle > 180.0) {
-      TotalYawAngle += -360.0;
-    }
-    if (TotalYawAngle > 0) {
+    if (currentAngle > 180) {
+      currentAngle -= 360;
       portSide = true;
-    } else {
+    }
+    if (currentAngle < -180) {
+      currentAngle += 360;
       portSide = false;
     }
-
-    currentAngle = abs(TotalYawAngle);
+    currentAngle = abs(currentAngle);
+    // if (ypr[0] * 180 / M_PI > 0) {  // This shit broken *******************************************************************************
+    //   portSide = true;
+    //   currentAngle = abs(ypr[0] * 180 / M_PI - windDirection);
+    // } else {
+    //   portSide = false;
+    //   currentAngle = abs(ypr[0] * 180 / M_PI + windDirection);
+    // }
   }
 }
 
 
 void setCourse() {
   if (!digitalRead(BUTTON_PIN)) {
-    TotalYawAngle = 0;
+    windDirection = ypr[0] * 180 / M_PI;
     //courseValue = currentAngle;
   }
 }
@@ -379,29 +459,9 @@ void upWind() {
 
 void controlMotor() {
   analogWrite(MOTOR_PIN_FORWARD, motorSpeed);
-  digitalWrite(MOTOR_PIN_BACKWARD, LOW);
+  analogWrite(MOTOR_PIN_BACKWARD, 0);
 }
 
-void gyro_signals(void) {
-  Wire.beginTransmission(0x68);
-  Wire.write(0x1A);
-  Wire.write(0x05);
-  Wire.endTransmission();
-  Wire.beginTransmission(0x68);
-  Wire.write(0x1B);
-  Wire.write(0x08);
-  Wire.endTransmission();
-  Wire.beginTransmission(0x68);
-  Wire.write(0x43);
-  Wire.endTransmission();
-  Wire.requestFrom(0x68, 6);
-  int16_t GyroX = Wire.read() << 8 | Wire.read();
-  int16_t GyroY = Wire.read() << 8 | Wire.read();
-  int16_t GyroZ = Wire.read() << 8 | Wire.read();
-  RateRoll = (float)GyroX / 65.5;
-  RatePitch = (float)GyroY / 65.5;
-  RateYaw = (float)GyroZ / 65.5;
-}
 
 void printFunction() {
   if (Serial) {
@@ -415,11 +475,11 @@ void printFunction() {
       Serial.println("");
       Serial.print("CurrentAngle: ");
       Serial.print(currentAngle);
-      Serial.print(" | Yaw Angle [°]= ");
-      Serial.print(TotalYawAngle);
+      Serial.print(" | TrueYaw = ");
+      Serial.print(ypr[0] * 180 / M_PI);
       Serial.print(" | ");
-      Serial.print("Course Value: ");
-      Serial.print(courseValue);
+      Serial.print("Wind Direction: ");
+      Serial.print(windDirection);
       Serial.print(" | ");
       Serial.print("RudderPOS: ");
       Serial.print(smoothedRudderServoValue);
